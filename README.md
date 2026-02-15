@@ -1,90 +1,175 @@
-CTF Writeup: Agent Root
+# CTF Writeup: Agent Root
 
-Target IP: 10.64.132.208
-1. Information Gathering & Port Scanning
+**Target IP:** 10.64.132.208  
 
-An initial port scan was conducted to identify open services and versions:
-Port	State	Service	Version
-21/tcp	open	
+---
 
-FTP
-	
+## 📌 Overview
 
-vsftpd 3.0.3 
+This machine demonstrates multiple attack techniques including:
 
-22/tcp	open	SSH	
+- User-Agent based content manipulation  
+- FTP brute force attack  
+- Steganography exploitation  
+- Password cracking  
+- Base64 decoding  
+- Sudo privilege escalation  
 
-OpenSSH 7.6p1 Ubuntu 4ubuntu0.3 
+---
 
-80/tcp	open	HTTP	
+## 1️⃣ Information Gathering & Port Scanning
 
-Apache httpd 2.4.29 
+An initial port scan was conducted to identify open services and versions.
 
-2. Web Enumeration
+| Port | State | Service | Version |
+|------|-------|---------|----------|
+| 21/tcp | open | FTP | vsftpd 3.0.3 |
+| 22/tcp | open | SSH | OpenSSH 7.6p1 Ubuntu 4ubuntu0.3 |
+| 80/tcp | open | HTTP | Apache httpd 2.4.29 |
 
-Directory discovery using gobuster with multiple wordlists yielded no results. However, a manual inspection of the page content revealed a clue: "from agent R".
+---
 
-User-Agent Fuzzing
+## 2️⃣ Web Enumeration
 
-I hypothesized that the server provides different content based on the User-Agent. Using curl -L to follow redirects and fuzzing the User-Agent header, I discovered that using "C" as the User-Agent revealed a secret message:
+Directory discovery using `gobuster` with multiple wordlists yielded no results.
 
-    "Attention chris, Do you still remember our deal? Please tell agent J about the stuff ASAP. Also, change your god damn password, is weak! From, Agent R" 
+However, manual inspection of the webpage revealed a clue:
 
-This confirmed the target username is chris.
+> "from agent R"
 
-3. Exploitation (FTP Brute Force)
+### 🔎 User-Agent Fuzzing
 
-Since the web message mentioned a weak password, I performed a brute-force attack against the FTP service using hydra and the rockyou.txt wordlist:
-Bash
+The server appeared to respond differently depending on the `User-Agent` header.
 
+Using:
+
+```bash
+curl -L -A "C" http://10.64.132.208
+```
+
+A hidden message was revealed:
+
+> "Attention chris, Do you still remember our deal? Please tell agent J about the stuff ASAP. Also, change your god damn password, is weak! From, Agent R"
+
+This confirmed the target username:
+
+```
+chris
+```
+
+---
+
+## 3️⃣ Exploitation – FTP Brute Force
+
+Since the message mentioned a weak password, a brute-force attack was performed against FTP using `hydra` and the `rockyou.txt` wordlist:
+
+```bash
 hydra -l chris -P /usr/share/wordlists/rockyou.txt 10.64.132.208 ftp
+```
 
-I successfully retrieved the password and logged in to download the available files:
+The correct password was recovered successfully.
 
-Bash
+After logging in via FTP:
 
+```bash
 mget *
+```
 
-4. Steganography & Data Extraction
+All available files were downloaded.
 
-Among the downloaded files was a note from Agent C to Agent J stating that the "alien-like photos" were fake and a login password was hidden inside a "fake picture".
+---
 
-Extracting the Hidden ZIP
+## 4️⃣ Steganography & Data Extraction
 
-Using binwalk, I identified and extracted a hidden ZIP file from one of the images:
+A note from Agent C indicated that:
 
-Bash
+- The "alien-like photos" were fake  
+- A login password was hidden inside a fake image  
 
+### 📦 Extracting Embedded ZIP
+
+Using `binwalk`:
+
+```bash
 binwalk -e <picture_name>
+```
 
-The ZIP was encrypted. I converted it to a hash format and cracked it using john the ripper:
+A hidden ZIP archive was extracted from one of the images.
 
-Bash
+The ZIP file was password protected.
 
-zip2john 8702.zip > zip_name.hash
-john zip_name.hash --wordlist=/usr/share/wordlists/rockyou.txt
+---
 
-Decoding the Passphrase
+### 🔓 Cracking the ZIP Password
 
-After unzipping the file with 7z, I found a .txt file containing a Base64 encoded string. Decoding this provided a passphrase.
+Converted the ZIP to a crackable hash format:
 
-Extracting SSH Credentials
+```bash
+zip2john 8702.zip > zip.hash
+john zip.hash --wordlist=/usr/share/wordlists/rockyou.txt
+```
 
-Using the decoded passphrase, I used steghide to extract hidden data from another image:
+The password was successfully cracked.
 
-Bash
+---
 
+### 🧩 Decoding the Passphrase
+
+After extracting the ZIP using `7z`, a `.txt` file containing a Base64 encoded string was found.
+
+Decoding the string revealed a passphrase.
+
+---
+
+### 🕵️ Extracting SSH Credentials
+
+Using the decoded passphrase with `steghide`:
+
+```bash
 steghide extract -sf <picture_name>.jpg
+```
 
-This revealed a new username and SSH password.
+This revealed:
 
-5. Initial Access & Privilege Escalation
+- A new username  
+- An SSH password  
 
-I established an SSH connection and began local enumeration. Checking the sudo version and permissions, I identified a known bypass vulnerability.
+---
 
-Exploit:
-Bash
+## 5️⃣ Initial Access & Privilege Escalation
 
+An SSH connection was established using the extracted credentials.
+
+During local enumeration, the `sudo` configuration was checked and a known privilege escalation technique was identified.
+
+### 🚀 Exploit
+
+```bash
 sudo -u#-1 /bin/bash
+```
 
-This command granted root access immediately. The final flag was located at /root/root.txt.
+This command granted immediate root access.
+
+---
+
+## 🏁 Root Flag
+
+The final flag was located at:
+
+```
+/root/root.txt
+```
+
+---
+
+## 🧠 Key Takeaways
+
+- Always test HTTP header manipulation (e.g., User-Agent)
+- Weak passwords remain a common attack vector
+- Steganography can hide valuable credentials
+- Password cracking tools remain powerful
+- Misconfigured sudo permissions can lead to instant privilege escalation
+
+---
+
+**End of Writeup**
