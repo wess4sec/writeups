@@ -18,7 +18,7 @@ sudo nano /etc/hosts
 Add:
 
 ```
-10.66.164.222    magician.thm
+10.66.164.222    magician
 ```
 
 Now we’re ready to begin enumeration.
